@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -126,6 +128,58 @@ def main() -> int:
                 print("       已恢复原剪贴板内容")
     else:
         print("       跳过（当前环境没有剪贴板工具）")
+
+    print("[8] text/uri-list 解析")
+    from mouse_kvm.clipboard import parse_uri_list
+    uris = ("file:///home/inper/work/usb.zip\r\n"
+            "# 注释行要跳过\r\n"
+            "file:///home/inper/%E4%B8%AD%E6%96%87.txt\r\n"
+            "https://example.com/a.txt\r\n")
+    paths = parse_uri_list(uris)
+    check("只留 file:// 且去掉注释",
+          paths == ["/home/inper/work/usb.zip", "/home/inper/中文.txt"], str(paths))
+    check("括号内容不当文件", parse_uri_list("copy\nfile:///a/b") == ["/a/b"])
+    check("空内容返回空", parse_uri_list("") == [])
+
+    print("[9] CF_HDROP 构造")
+    from mouse_kvm.clipboard import dropfiles_payload
+    payload = dropfiles_payload([r"C:\a\b.txt", r"C:\c\d.txt"])
+    import struct as _s
+    p_files, _x, _y, fnc, fwide = _s.unpack_from("<IiiII", payload, 0)
+    check("头部 pFiles 指向 20 字节处", p_files == 20, str(p_files))
+    check("按宽字符写", fwide == 1)
+    check("不是非客户区", fnc == 0)
+    body = payload[20:].decode("utf-16-le")
+    check("路径都在且双 \\0 结尾",
+          body == "C:\\a\\b.txt\x00C:\\c\\d.txt\x00\x00", repr(body))
+
+    print("[10] 真实把文件放进剪贴板")
+    if sys.platform == "win32":
+        from mouse_kvm.clipboard import WinClipboard
+        tmpdir = tempfile.mkdtemp(prefix="kvm-clip-")
+        probe_file = os.path.join(tmpdir, "kvm-clip-test.txt")
+        with open(probe_file, "w", encoding="utf-8") as fh:
+            fh.write("hello\n")
+        cb = WinClipboard()
+        prev_text = cb.get_text()
+        try:
+            prev_files = cb.get_file_uris()
+            check("写入 CF_HDROP 成功", cb.set_files([probe_file]))
+            got = cb.get_file_uris()
+            check("读回来是同一个文件",
+                  [os.path.normcase(p) for p in got]
+                  == [os.path.normcase(probe_file)], str(got))
+            time.sleep(0.2)
+            check("文本格式已让位（Explorer 要的是文件）",
+                  cb.get_text() in (None, ""), repr(cb.get_text()))
+        finally:
+            if prev_files:
+                cb.set_files(prev_files)
+            elif prev_text is not None:
+                cb.set_text(prev_text)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    else:
+        print("       跳过（只在 Windows 上测）")
 
     print("\n通过 %d 项，失败 %d 项" % (PASS, FAIL))
     return 0 if FAIL == 0 else 1

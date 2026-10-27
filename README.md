@@ -15,11 +15,15 @@
    │  光标推到屏幕边缘 ──→ 切换     │
    │        ↓                     │
    │  TCP :24800  ────────────────┼──→ 从机 A
-   └──────────────────────────────┘        从机 B
-                                          ...
-                                            ↓
-                                     注入本机键鼠
+   │        ↑                     │        从机 B
+   └────────┼─────────────────────┘        ...
+            │                                ↓
+   127.0.0.1:24801                    注入本机键鼠
+   （kvm.py send / status 连这里）
 ```
+
+键鼠事件、剪贴板、文件传输**共用这一条 TCP 连接**，
+帧之间靠长度前缀区分，不会互相串。
 
 屏幕是按方位摆的：
 
@@ -76,11 +80,41 @@ python kvm.py client --name ubuntu --host 192.168.1.20
 
 复制即同步，双向。Windows 上 `Ctrl+C`，切到 Linux 直接 `Ctrl+V`，反过来也一样。
 
-- **只同步文本**。图片、文件、富文本格式一律跳过。
+### 文本
+
+- **只同步纯文本**。图片、富文本格式一律跳过。
 - 单条上限 256KB，超了不同步 —— 大段内容会把网络和注入都拖慢。
 - **防回环**：程序自己写进剪贴板的内容不会再被推回去，不会两边互相刷。
 - 关掉就用 `--no-clip`。
 - 剪贴板同步跟光标在不在那台机器上无关，复制完随时能粘。
+
+### 文件
+
+**在 Linux 上 `Ctrl+C` 一个文件，到 Windows 的资源管理器里右键就有「粘贴」。**
+
+不是把路径当文本发过去 —— 那样 Windows 只会收到一串 `/home/xxx/a.zip` 文字，
+右键菜单里根本不会出现「粘贴」，因为资源管理器认的是 `CF_HDROP`（真正的文件列表）。
+所以做的是真传输：
+
+```
+Linux 上 Ctrl+C
+   ↓ 读到 text/uri-list，发现是文件
+推送文件到 Windows（同一个协议，有进度）
+   ↓ 落到 下载/mouse-kvm/
+把落盘路径塞进 Windows 剪贴板当 CF_HDROP
+   ↓
+右键粘贴 / Ctrl+V 都正常，粘出来的是真文件
+```
+
+限制：
+
+- 一次最多 20 个文件，单个上限 512MB（跟 `send` 一致）。
+- 剪贴板里落的是 `下载/mouse-kvm/` 下的副本，粘贴到别处是再复制一份。
+  原文件在 Linux 上，那边不动。
+- **只有 Linux → Windows 这个方向**。反方向（Windows 复制文件 → Linux 粘贴）
+  需要 GNOME 的 `x-special/gnome-copied-files`，各文件管理器兼容性不一，
+  暂时没做 —— 用 `kvm.py send` 推过去即可。
+- 文件名会自动加后缀避免覆盖（`a.txt` → `a-1.txt`）。
 
 Linux 端需要剪贴板工具，Wayland 装 `wl-clipboard`，X11 装 `xclip`：
 
@@ -91,6 +125,60 @@ sudo apt install xclip            # X11 会话
 
 程序启动时会打印用的是哪个实现，例如 `剪贴板同步已启用（wayland）`。
 如果提示不可用，说明上面两个都没装，或者当前会话没有图形环境变量。
+
+## 文件传输
+
+一条命令把文件推给对端，**双向都行**，落到对方的 `下载/mouse-kvm/` 目录。
+
+```bash
+# Windows 上推给 Linux
+python kvm.py send 报告.pdf
+
+# Linux 上推给 Windows（在从机那边执行同样命令）
+python3 kvm.py send ~/a.zip
+
+# 多台从机时指定目标
+python kvm.py send a.zip --to ubuntu
+
+# 一次传多个
+python kvm.py send a.txt b.txt c.zip
+```
+
+跑起来长这样：
+
+```
+  -> linux  1.4 MB
+  100.0%  1.4 MB / 1.4 MB
+  已送达 linux：/home/inper/Downloads/mouse-kvm/report.pdf
+```
+
+要用的时候两端的 KVM 必须在运行 —— `send` 只是给正在跑的进程发个指令，
+自己不建连接、也不做传输。看一眼谁在线：
+
+```bash
+python kvm.py status
+```
+
+```
+主机：winbox
+  linux            位置=right  屏幕=3840x2160  在线
+```
+
+细节：
+
+- 走的是 KVM **已有的那条 TCP 连接**，不额外开端口，不用配 SCP/SFTP/共享目录。
+- 重名自动加后缀（`a.txt` → `a-1.txt`），**绝不覆盖**已有文件。
+- 接收方先写 `.part` 临时文件，大小核对上了才改成正式名字。
+  传到一半断了不会留下半截文件，也不会让你以为收到了。
+- 单文件上限 512MB。更大的走 U 盘或者 `scp` 更合适。
+- 传输过程不打断键鼠操作。发送在独立线程里跑，两边共用连接但帧不会串。
+- 文件名做了清洗：路径穿越（`../../etc/passwd`）、Windows 非法字符、
+  `CON`/`NUL` 这类保留名都会被处理掉。中文文件名正常。
+
+速度取决于网络。这台机器实测 100MB 用了 29 秒（约 3.5 MB/s），
+同一条链路上 `scp` 是 28 秒 —— 也就是说瓶颈在带宽，不在协议。
+
+浏览器下载那种"复制文件"的操作不会自动触发传输，得显式跑 `send`。
 
 ## 常驻运行
 
@@ -166,6 +254,7 @@ python kvm.py client --name ubuntu --host 192.168.1.20 --token mysecret
 | `--edge N` | 推到边缘多少次触发切换，默认 3，越小越灵敏 |
 | `--no-clip` | 关闭剪贴板同步 |
 | `--bind` | 监听地址，默认 `0.0.0.0` |
+| `--ctl-port` | 本地控制通道端口，`send`/`status` 用，默认 `端口+1` |
 
 从机：
 
@@ -176,6 +265,15 @@ python kvm.py client --name ubuntu --host 192.168.1.20 --token mysecret
 | `--port` | 主机端口 |
 | `--token` | 连接口令 |
 | `--no-clip` | 关闭剪贴板同步 |
+| `--ctl-port` | 本地控制通道端口，默认 `端口+1` |
+
+`send` / `status`：
+
+| 参数 | 说明 |
+|---|---|
+| `--to` | 目标从机名，只有一台时可省略 |
+| `--ctl-port` | 要连的控制通道端口，默认 24801 |
+| `--ctl-host` | 控制通道地址，默认 `127.0.0.1` |
 
 ## 自测
 
@@ -183,7 +281,10 @@ python kvm.py client --name ubuntu --host 192.168.1.20 --token mysecret
 python kvm.py probe              # 只监听不拦截，验证钩子/权限
 python tests/test_logic.py       # 主机端状态机（假后端，不碰真实输入）
 python tests/test_client.py      # 从机端注入与按键清理
+python tests/test_clip.py        # 剪贴板同步、去重、防回环
+python tests/test_filetransfer.py # 文件分块、拼回、大小校验、完整往返
 python tests/test_inject.py      # 真实注入（会短暂动一下光标，自动归位）
+python tools/diag_clip.py        # 看 Windows 剪贴板里有哪些格式（排查粘贴问题）
 ```
 
 ## 出问题时先看这里
@@ -206,11 +307,34 @@ Linux 主机需要 `grab` 设备，权限不够会静默失败 —— 用 `probe
 **回到本机后 Ctrl 卡住**
 正常不会。真遇到了说明切换时按键释放没执行，把 `tests/test_client.py` 跑一遍看是哪一步漏了。
 
+**Linux 上复制文件，Windows 右键没有"粘贴"**
+先跑 `python tools/diag_clip.py` 看 Windows 剪贴板里是什么格式：
+
+- 只有 `CF_UNICODETEXT`，内容是 `/home/xxx/a.zip` 这样的路径文字
+  → 那是把文件当文本发了，资源管理器不认。确认从机是当前版本
+  （日志里应该有 `剪贴板里有 1 个文件，开始推到主机`）。
+- 有 `CF_HDROP` → 剪贴板已经就绪，右键"粘贴"应该正常。
+  如果还是没有，是那个程序自己的问题（比如在某个应用的输入框里右键，
+  文本粘贴走的是 `CF_UNICODETEXT`，跟文件是两条路）。
+
+**`send` 报"连不上控制通道"**
+两端进程没在跑，或者 `--port` 改过但 `send` 没跟着改 `--ctl-port`。
+`kvm.py status` 能查在线情况；控制通道只监听 `127.0.0.1`，不能跨机用。
+
+**`send` 报"找不到从机"**
+从机还没连上来，或者名字跟主机 `--peer` 里写的不一致。`status` 会列出在线的名字。
+
+**文件传到一半断了**
+对端会收到 `大小不符` 并删掉临时文件，主机这边 `send` 直接报错退出。
+重跑一次即可，重名的会自动变成 `-1`。
+
 ## 已知限制
 
 - 从机只支持单显示器，多屏会全部映射到主屏。
-- 剪贴板只同步纯文本，图片、文件、富文本不同步。单条上限 256KB。
-- 没做文件拖拽和音频传输。
+- 剪贴板同步文本是双向的；复制文件只支持 Linux → Windows（`CF_HDROP`），
+  反方向没做。文本单条上限 256KB。
+- 文件传输要显式跑 `send`，没有做拖拽触发；单文件上限 512MB。
+- 没做音频传输。
 - 不支持 macOS（后端没写）。
 - Linux 做主机的时，光标坐标是自己累加估算的（Wayland 没有查询光标的公开接口），
   在屏幕边缘会自动对齐，中间位置可能有一两个像素误差，不影响使用。
@@ -233,18 +357,25 @@ Linux 主机需要 `grab` 设备，权限不够会静默失败 —— 用 `probe
 - Wayland 下 uinput 虚拟鼠标能被正常识别成指针设备（`xinput` 里能看到 slave pointer）。
 - 相对模式注入会被系统鼠标加速放大，所以默认走绝对坐标。
 - 两台都是 4K 时坐标是 1:1 映射；分辨率不同会按比例缩放。
+- 剪贴板双向实测：`WIN2LINUX_MARKER` / `LINUX2WIN_MARKER` 两个方向都到达。
+- 文件传输双向实测 MD5 一致：1.5MB 文本、900KB 二进制、100MB 随机数据各一遍。
+- 100MB 传输 29 秒 vs `scp` 28 秒，协议开销可以忽略，瓶颈在带宽。
+- Linux 复制文件 → Windows 剪贴板里出现 `CF_HDROP`，文件落在
+  `下载/mouse-kvm/`，右键粘贴拿到的是真文件。
 
 
 ## 目录结构
 
 ```
-kvm.py                     命令行入口（host / client / probe）
+kvm.py                     命令行入口（host / client / send / status / probe）
 mouse_kvm/
   protocol.py              长度前缀 + JSON 的 TCP 帧
   keys.py                  Windows VK <-> Linux evdev 键码双向映射
   host.py                  主机状态机：边缘判定、坐标映射、压制转发
   client.py                从机：接收并注入
   clipboard.py             剪贴板同步（Win32 API / wl-clipboard / xclip）
+  filetransfer.py          文件分块收发（两端共用，base64 塞 JSON 帧）
+  control.py               本地控制通道（127.0.0.1，一行一个 JSON）
   backend/
     base.py                后端抽象
     win32.py               Win32 低级钩子 + SendInput
@@ -266,3 +397,17 @@ tests/                     自测脚本
 
 **为什么要做 DPI 感知**：4K 屏开 150% 缩放时，不设 DPI 感知会让
 `GetSystemMetrics` 和钩子返回的坐标不是一个坐标系，注入位置就会偏。
+
+**文件为什么走 base64 而不是二进制帧**：协议是"长度前缀 + JSON"，
+塞二进制就得改帧格式、加分流逻辑。base64 多 33% 体积，但在这条链路上
+带宽才是瓶颈（实测跟 `scp` 打平），省下的复杂度更值。分块 256KB 是因为
+帧上限 8MB，块太大一旦出错要重传的也多。
+
+**为什么 `send` 要靠本地控制通道**：`kvm.py send` 是个短命进程，
+它拿不到主机进程里那些连接对象。开一条 `127.0.0.1` 的 socket，
+`send` 把"文件路径 + 目标"发过去，真正的传输由常驻进程完成 ——
+这样 CLI 退出也不影响传输，还能顺便把进度一行行回传。
+
+**传输为什么不阻塞键鼠**：发送在独立线程里跑，每帧发送前拿
+`FramedConnection` 的锁。所以大文件传到一半你照样能把鼠标推过去，
+最多多几毫秒延迟。

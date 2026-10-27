@@ -249,6 +249,15 @@ class LinuxBackend(Backend):
         return None
 
     # -- 注入 ---------------------------------------------------------------
+    def prewarm(self) -> None:
+        """启动时就把 uinput 设备建出来。
+
+        权限不足时这里会立刻抛异常，而不是等第一次注入才失败。
+        """
+        screen = self.screen_size()
+        self._ensure_mouse(screen)
+        self._ensure_kbd()
+
     def _ensure_mouse(self, screen: tuple[int, int]) -> UInput:
         if self._mouse_ui is not None:
             return self._mouse_ui

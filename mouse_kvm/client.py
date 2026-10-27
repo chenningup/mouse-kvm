@@ -8,12 +8,18 @@
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import socket
+import threading
 import time
+from pathlib import Path
 
-from . import protocol as P
+from . import control, protocol as P
 from .backend.base import Backend
 from .clipboard import MAX_TEXT_BYTES, ClipboardSync
+from .filetransfer import (MAX_FILE_SIZE, FileSender, ReceiveSession,
+                           TransferError, human_size, new_transfer_id)
 from .keys import key_name
 
 log = logging.getLogger("kvm.client")
@@ -21,15 +27,34 @@ log = logging.getLogger("kvm.client")
 RECONNECT_DELAY = 2.0
 
 
+class _SendJob:
+    """把一批文件推给主机。
+
+    set_clip=True 表示推完还要让主机把它们放进剪贴板 ——
+    这样在 Linux 上 Ctrl+C 一个文件，到 Windows 上右键就有"粘贴"。
+    """
+
+    def __init__(self, paths, set_clip: bool = False) -> None:
+        self.paths = list(paths)
+        self.set_clip = set_clip
+        self.done = threading.Event()
+        self.result: dict | None = None
+        self.error: str | None = None
+        self.start_cb = None
+        self.progress_cb = None
+
+
 class Client:
     def __init__(self, name: str, host: str, port: int, backend: Backend,
-                 token: str = "", enable_clip: bool = True) -> None:
+                 token: str = "", enable_clip: bool = True,
+                 ctl_port: int | None = None) -> None:
         self.name = name
         self.host = host
         self.port = port
         self.token = token
         self.backend = backend
         self.screen = backend.screen_size()
+        self.ctl_port = ctl_port if ctl_port is not None else port + 1
 
         self.conn: P.FramedConnection | None = None
         self.running = False
@@ -40,16 +65,48 @@ class Client:
 
         self.clip: ClipboardSync | None = ClipboardSync() if enable_clip else None
 
+        # 文件传输：接收走这台机器的 rx（主机推过来的），
+        # 发送走本地控制通道（kvm.py send 在这里跑）。
+        self.rxfile = ReceiveSession(self._file_send, label="host")
+        self.ctl: control.ControlServer | None = None
+        self._send_q: queue.Queue = queue.Queue()
+        self._send_worker: threading.Thread | None = None
+        self._xfer_lock = threading.Lock()
+        self._senders: dict[str, FileSender] = {}
+
     # -- 主流程 -------------------------------------------------------------
     def run(self) -> None:
         self.running = True
         self.backend.start()
+
+        # 先把注入通道建起来，权限有问题要在启动时就暴露，
+        # 不能等用户把鼠标推过来的那一瞬间才崩。
+        try:
+            self.backend.prewarm()
+        except Exception as exc:
+            log.error("输入注入初始化失败：%s", exc)
+            log.error("Linux 上通常是权限问题 —— 确认当前用户在 input 组，"
+                      "并且 systemd 服务里写了 SupplementaryGroups=input。"
+                      "手动验证：python3 kvm.py probe")
+            self.backend.stop()
+            self.running = False
+            return
+
         if self.clip is not None:
             if self.clip.enabled:
                 self.clip.on_change = self._on_local_clip
+                self.clip.on_files = self._on_local_files
                 self.clip.start()
             else:
                 log.warning("剪贴板同步不可用（缺少 wl-clipboard / xclip）")
+
+        # 文件传输的控制通道和发送线程
+        self._send_worker = threading.Thread(target=self._send_loop,
+                                             name="kvm-send", daemon=True)
+        self._send_worker.start()
+        self.ctl = control.ControlServer(self.ctl_port, self._on_ctl_request)
+        self.ctl.start()
+
         log.info("从机 %s 启动，本机屏幕 %dx%d，目标 %s:%d",
                  self.name, self.screen[0], self.screen[1],
                  self.host, self.port)
@@ -69,6 +126,11 @@ class Client:
                     time.sleep(RECONNECT_DELAY)
         finally:
             self._release_all()
+            self.rxfile.close()
+            if self.ctl is not None:
+                self.ctl.stop()
+                self.ctl = None
+            self._send_q.put(None)
             if self.clip is not None:
                 self.clip.stop()
             self.backend.stop()
@@ -142,6 +204,17 @@ class Client:
             if self.clip is not None and self.clip.apply_remote(text):
                 log.info("<< 剪贴板来自主机（%d 字符）", len(text))
 
+        elif t in (P.MSG_FILE_REQ, P.MSG_FILE_CHUNK, P.MSG_FILE_END):
+            self.rxfile.handle(msg)
+
+        elif t == P.MSG_FILE_ACK:
+            fid = str(msg.get("id") or "")
+            with self._xfer_lock:
+                sender = self._senders.get(fid)
+            if sender is not None:
+                sender.deliver_ack(bool(msg.get("ok")), msg.get("path"),
+                                   msg.get("err"))
+
         elif t == P.MSG_LEAVE:
             self.active = False
             self._release_all()
@@ -155,7 +228,137 @@ class Client:
             log.info("主机要求断开")
             self.running = False
 
+    # -- 文件传输 -----------------------------------------------------------
+    def _file_send(self, obj: dict) -> None:
+        """给接收会话用的发送函数：连接没了就明确报错。"""
+        conn = self.conn
+        if conn is None:
+            raise ConnectionError("尚未连上主机")
+        conn.send(obj)
+
+    def _on_ctl_request(self, req: dict, reply) -> None:
+        cmd = (req or {}).get("cmd")
+        if cmd == "send":
+            self._ctl_send(req, reply)
+        elif cmd == "status":
+            reply({"t": "done", "ok": True, "client": self.name,
+                   "host": self._host_name,
+                   "connected": self.conn is not None,
+                   "active": self.active})
+        else:
+            reply({"t": "done", "ok": False,
+                   "err": "未知命令：%s（支持 send / status）" % cmd})
+
+    def _ctl_send(self, req: dict, reply) -> None:
+        raw = str(req.get("path") or "")
+        if not raw:
+            reply({"t": "done", "ok": False, "err": "缺少 path"})
+            return
+        path = Path(os.path.abspath(os.path.expanduser(raw)))
+        if not path.is_file():
+            reply({"t": "done", "ok": False, "err": "不是文件：%s" % path})
+            return
+        job = _SendJob([path])
+        job.start_cb = lambda peer_name, size: reply(
+            {"t": "start", "to": peer_name, "size": size, "name": path.name})
+        job.progress_cb = lambda sent, total: reply(
+            {"t": "progress", "sent": sent, "total": total})
+        self._send_q.put(job)
+        job.done.wait()
+        if job.error:
+            reply({"t": "done", "ok": False, "err": job.error})
+        else:
+            result = job.result or {}
+            reply({"t": "done", "ok": True,
+                   "path": result.get("path"), "to": result.get("to")})
+
+    def _send_loop(self) -> None:
+        while True:
+            job = self._send_q.get()
+            if job is None:
+                return
+            try:
+                if not self.running:
+                    job.error = "从机正在退出"
+                    continue
+                job.result = self._do_send(job)
+            except Exception as exc:   # noqa: BLE001
+                job.error = str(exc)
+                log.warning("发送失败：%s", exc)
+            finally:
+                job.done.set()
+
+    def _do_send(self, job) -> dict:
+        results = []
+        for path in job.paths:
+            results.append(self._send_one(path, job))
+        if job.set_clip and results:
+            paths = [r.get("path") for r in results if r.get("path")]
+            if paths:
+                conn = self.conn
+                if conn is None:
+                    raise TransferError("与主机的连接已断开")
+                conn.send({"t": P.MSG_CLIP_FILES, "paths": paths})
+                log.info("文件已推到主机剪贴板（%d 个），可以在 Windows 上粘贴了",
+                         len(paths))
+        return results[-1] if results else {}
+
+    def _send_one(self, path: Path, job) -> dict:
+        size = path.stat().st_size
+        fid = new_transfer_id()
+
+        def send_fn(obj: dict) -> None:
+            conn = self.conn
+            if conn is None or not self.running:
+                raise TransferError("与主机的连接已断开")
+            conn.send(obj)
+
+        if job.start_cb:
+            job.start_cb(self._host_name, size)
+        log.info(">> 发送 %s（%s）到主机",
+                 path.name, human_size(size))
+
+        sender = FileSender(fid, path, send_fn, job.progress_cb)
+        with self._xfer_lock:
+            self._senders[fid] = sender
+        try:
+            result = sender.run()
+        finally:
+            with self._xfer_lock:
+                self._senders.pop(fid, None)
+
+        log.info(">> 已送达主机：%s", result.get("path"))
+        return {"path": result.get("path"), "to": self._host_name}
+
     # -- 剪贴板 -------------------------------------------------------------
+    def _on_local_files(self, files: list[str]) -> None:
+        """本机复制的是一批文件（文件管理器里 Ctrl+C）。
+
+        不能当文本发 —— Windows 收到字符串只是段路径文字，
+        资源管理器右键不会出现"粘贴"，因为它认的是 CF_HDROP。
+        所以这里走真正的传输，落盘后再让主机把路径放进剪贴板。
+        """
+        paths: list[Path] = []
+        for raw in files:
+            p = Path(raw)
+            try:
+                if not p.is_file():
+                    continue
+                if p.stat().st_size > MAX_FILE_SIZE:
+                    log.warning("文件太大，不进剪贴板：%s（%s）",
+                                p.name, human_size(p.stat().st_size))
+                    continue
+            except OSError:
+                continue
+            paths.append(p)
+        if not paths:
+            return
+        if len(paths) < len(files):
+            log.warning("只同步了 %d/%d 个文件", len(paths), len(files))
+        log.info("剪贴板里有 %d 个文件，开始推到主机（%s）",
+                 len(paths), ", ".join(p.name for p in paths[:3]))
+        self._send_q.put(_SendJob(paths, set_clip=True))
+
     def _on_local_clip(self, text: str) -> None:
         """本机剪贴板变了，推给主机。"""
         conn = self.conn

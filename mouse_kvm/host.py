@@ -13,14 +13,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import socket
 import threading
 import time
+from pathlib import Path
 
-from . import protocol as P
+from . import control, protocol as P
 from .backend import Backend
 from .clipboard import MAX_TEXT_BYTES, ClipboardSync, digest
+from .filetransfer import (FileSender, ReceiveSession, TransferError,
+                           human_size, new_transfer_id)
 from .keys import key_name
 
 log = logging.getLogger("kvm.host")
@@ -66,11 +70,24 @@ class Peer:
                                             self.screen[0], self.screen[1])
 
 
+class _SendJob:
+    """一次"推文件给某台从机"的请求，控制线程和发送线程靠它汇合。"""
+
+    def __init__(self, path: Path, to_name: str | None) -> None:
+        self.path = path
+        self.to_name = to_name
+        self.done = threading.Event()
+        self.result: dict | None = None
+        self.error: str | None = None
+        self.start_cb = None
+        self.progress_cb = None
+
+
 class Host:
     def __init__(self, name: str, port: int, peer_sides: dict[str, str],
                  backend: Backend, token: str = "", bind: str = "0.0.0.0",
                  edge_threshold: int = 3, enable_clip: bool = True,
-                 clip=None) -> None:
+                 clip=None, ctl_port: int | None = None) -> None:
         self.name = name
         self.port = port
         self.bind = bind
@@ -78,6 +95,7 @@ class Host:
         self.peer_sides = dict(peer_sides)
         self.edge_threshold = max(1, edge_threshold)
         self.backend = backend
+        self.ctl_port = ctl_port if ctl_port is not None else port + 1
 
         self.local_screen = backend.screen_size()
         self._screen_cache = self.local_screen
@@ -113,12 +131,29 @@ class Host:
             self.clip = ClipboardSync() if enable_clip else None
         self._clip_hash: bytes | None = None
 
+        # 文件传输：发送串行排队（同时推多个大文件只会互相拖慢），
+        # 接收按从机名各存一个会话。
+        self.ctl: control.ControlServer | None = None
+        self._send_q: queue.Queue = queue.Queue()
+        self._send_worker: threading.Thread | None = None
+        self._xfer_lock = threading.Lock()
+        self._senders: dict[str, FileSender] = {}
+        self._receivers: dict[str, ReceiveSession] = {}
+
     # -- 启动/停止 ----------------------------------------------------------
     def run(self) -> None:
         self.running = True
         self.backend.sink = self._sink
         self.backend.start()
         self._start_server()
+
+        # 文件传输的控制通道和发送线程。起不来只是少了 send 能力，不影响键鼠。
+        self._send_worker = threading.Thread(target=self._send_loop,
+                                             name="kvm-send", daemon=True)
+        self._send_worker.start()
+        self.ctl = control.ControlServer(self.ctl_port, self._on_ctl_request)
+        self.ctl.start()
+
         if self.clip is not None:
             if self.clip.enabled:
                 self.clip.on_change = self._on_local_clip
@@ -171,6 +206,10 @@ class Host:
 
     def shutdown(self) -> None:
         self.running = False
+        if self.ctl is not None:
+            self.ctl.stop()
+            self.ctl = None
+        self._send_q.put(None)
         if self.clip is not None:
             self.clip.stop()
         if self.remote:
@@ -244,6 +283,138 @@ class Host:
             if name != src and peer.alive:
                 peer.send({"t": P.MSG_CLIP, "text": text})
         log.info("<< 剪贴板来自 %s（%d 字符）", src, len(text))
+
+    def _apply_clip_files(self, src: str, paths) -> None:
+        """从机接过来一批文件，放进本机剪贴板当"复制的文件"。
+
+        资源管理器的右键"粘贴"只认 CF_HDROP，光有文本是没有那一项的。
+        """
+        paths = [p for p in paths if isinstance(p, str)]
+        if not paths:
+            return
+        if self.clip is None:
+            log.warning("剪贴板未启用，忽略来自 %s 的文件", src)
+            return
+        if self.clip.apply_remote_files(paths):
+            log.info("<< 剪贴板已放入来自 %s 的 %d 个文件（现在可以右键粘贴了）",
+                     src, len(paths))
+
+    # -- 文件传输 -----------------------------------------------------------
+    def _on_ctl_request(self, req: dict, reply) -> None:
+        """kvm.py send 连进来后的入口。跑在控制通道线程里。"""
+        cmd = (req or {}).get("cmd")
+        if cmd == "send":
+            self._ctl_send(req, reply)
+        elif cmd == "status":
+            peers = [{"name": p.name, "side": p.side,
+                      "screen": list(p.screen), "alive": p.alive}
+                     for p in list(self.peers.values())]
+            reply({"t": "done", "ok": True, "host": self.name,
+                   "peers": peers})
+        else:
+            reply({"t": "done", "ok": False,
+                   "err": "未知命令：%s（支持 send / status）" % cmd})
+
+    def _ctl_send(self, req: dict, reply) -> None:
+        raw = str(req.get("path") or "")
+        if not raw:
+            reply({"t": "done", "ok": False, "err": "缺少 path"})
+            return
+        path = Path(os.path.abspath(os.path.expanduser(raw)))
+        if not path.is_file():
+            reply({"t": "done", "ok": False, "err": "不是文件：%s" % path})
+            return
+
+        job = _SendJob(path, req.get("to") or None)
+        job.start_cb = lambda peer_name, size: reply(
+            {"t": "start", "to": peer_name, "size": size,
+             "name": path.name})
+        job.progress_cb = lambda sent, total: reply(
+            {"t": "progress", "sent": sent, "total": total})
+        self._send_q.put(job)
+        job.done.wait()
+
+        if job.error:
+            reply({"t": "done", "ok": False, "err": job.error})
+        else:
+            result = job.result or {}
+            reply({"t": "done", "ok": True,
+                   "path": result.get("path"), "to": result.get("to")})
+
+    def _send_loop(self) -> None:
+        """串行执行发送任务 —— 同时推多个大文件只会互相拖慢。"""
+        while True:
+            job = self._send_q.get()
+            if job is None:
+                return
+            try:
+                if not self.running:
+                    job.error = "主机正在退出"
+                    continue
+                job.result = self._do_send(job)
+            except Exception as exc:   # noqa: BLE001
+                job.error = str(exc)
+                log.warning("发送失败：%s", exc)
+            finally:
+                job.done.set()
+
+    def _do_send(self, job) -> dict:
+        peer = self._pick_peer(job.to_name)
+        size = job.path.stat().st_size
+        fid = new_transfer_id()
+
+        def send_fn(obj: dict) -> None:
+            # 不走 Peer.send —— 它会把异常吞掉只标记断开，
+            # 那样发送线程会一路空转到文件末尾才发现失败。
+            if not peer.alive:
+                raise TransferError("与 %s 的连接已断开" % peer.name)
+            peer.conn.send(obj)
+
+        if job.start_cb:
+            job.start_cb(peer.name, size)
+        log.info(">> 发送 %s（%s）到 %s",
+                 job.path.name, human_size(size), peer.name)
+
+        sender = FileSender(fid, job.path, send_fn, job.progress_cb)
+        with self._xfer_lock:
+            self._senders[fid] = sender
+        try:
+            result = sender.run()
+        finally:
+            with self._xfer_lock:
+                self._senders.pop(fid, None)
+
+        log.info(">> 已送达 %s：%s", peer.name, result.get("path"))
+        return {"path": result.get("path"), "to": peer.name}
+
+    def _pick_peer(self, name: str | None):
+        peers = list(self.peers.values())
+        if name:
+            for peer in peers:
+                if peer.name == name:
+                    if not peer.alive:
+                        raise TransferError("从机 %s 不在线" % name)
+                    return peer
+            raise TransferError("找不到从机 %s（在线：%s）"
+                                % (name, ", ".join(p.name for p in peers) or "无"))
+        alive = [p for p in peers if p.alive]
+        if not alive:
+            raise TransferError("没有在线的从机")
+        if len(alive) > 1:
+            raise TransferError("有多台从机在线，请用 --to 指定：%s"
+                                % ", ".join(p.name for p in alive))
+        return alive[0]
+
+    def _receiver_for(self, peer_name: str) -> ReceiveSession | None:
+        sess = self._receivers.get(peer_name)
+        if sess is not None:
+            return sess
+        peer = self.peers.get(peer_name)
+        if peer is None:
+            return None
+        sess = ReceiveSession(peer.send, label=peer_name)
+        self._receivers[peer_name] = sess
+        return sess
 
     # -- 本地事件 -----------------------------------------------------------
     def _on_local(self, ev) -> None:
@@ -563,6 +734,9 @@ class Host:
         self.peers.pop(peer.name, None)
         if self.peers_by_side.get(peer.side) is peer:
             self.peers_by_side.pop(peer.side, None)
+        sess = self._receivers.pop(peer.name, None)
+        if sess is not None:
+            sess.close()
         peer.close()
         log.info("从机 %s 已移除：%s", peer.name, reason)
 
@@ -574,5 +748,20 @@ class Host:
                 self._drop_peer(peer, "对端主动退出")
         elif t == P.MSG_CLIP:
             self._relay_clip(src, msg.get("text") or "")
+        elif t == P.MSG_CLIP_FILES:
+            self._apply_clip_files(src, msg.get("paths") or [])
+        elif t == P.MSG_FILE_ACK:
+            fid = str(msg.get("id") or "")
+            with self._xfer_lock:
+                sender = self._senders.get(fid)
+            if sender is not None:
+                sender.deliver_ack(bool(msg.get("ok")), msg.get("path"),
+                                   msg.get("err"))
+            else:
+                log.debug("收到未知传输的 ACK：%s", fid)
+        elif t in (P.MSG_FILE_REQ, P.MSG_FILE_CHUNK, P.MSG_FILE_END):
+            sess = self._receiver_for(src)
+            if sess is not None:
+                sess.handle(msg)
         elif t == P.MSG_PONG:
             pass

@@ -12,6 +12,7 @@ venv/
 # 本地凭据与日志
 tools/.env
 *.log
+*.pid
 logs/
 
 # 编辑器 / 系统

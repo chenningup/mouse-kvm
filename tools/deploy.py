@@ -44,6 +44,8 @@ FILES = [
     "mouse_kvm/host.py",
     "mouse_kvm/client.py",
     "mouse_kvm/clipboard.py",
+    "mouse_kvm/control.py",
+    "mouse_kvm/filetransfer.py",
     "mouse_kvm/backend/__init__.py",
     "mouse_kvm/backend/base.py",
     "mouse_kvm/backend/linux.py",

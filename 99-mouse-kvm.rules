@@ -1,14 +1,19 @@
 # /etc/udev/rules.d/99-mouse-kvm.rules
 #
-# 让 input 组的用户能读写输入设备和 /dev/uinput，
+# 让普通用户能读写输入设备和 /dev/uinput，
 # 这样 mouse-kvm 不用 root 也能捕获和注入事件。
+#
+# 关键点是 TAG+="uaccess"：udev 会交给 systemd-logind 打标签，
+# logind 再给"当前坐在机器前的用户"加 ACL 权限。
+# 这比依赖 input 组更可靠 —— systemd --user 服务是登录时启动的，
+# 之后用 usermod 新加的组不会自动带进服务进程里。
 #
 # 安装：
 #   sudo cp 99-mouse-kvm.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules
 #   sudo udevadm trigger
-#   sudo usermod -aG input $USER      # 之后要重新登录
+#   sudo usermod -aG input $USER      # 可选，作为兜底
 
-KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
-SUBSYSTEM=="input", KERNEL=="mouse*", MODE="0660", GROUP="input"
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput", MODE="0660", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess", MODE="0660", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="mouse*", TAG+="uaccess", MODE="0660", GROUP="input"

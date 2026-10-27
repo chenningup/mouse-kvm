@@ -7,6 +7,13 @@
     # 另一台（从机）
     python kvm.py client --name ubuntu --host 192.168.1.20
 
+    # 推文件给对端（两端都要在运行）
+    python kvm.py send 报告.pdf
+    python kvm.py send a.zip --to ubuntu
+
+    # 看谁在线
+    python kvm.py status
+
     # 单纯验证输入权限/钩子是否正常
     python kvm.py probe
 """
@@ -14,14 +21,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import signal
+import socket
 import sys
 import time
 
-from mouse_kvm import __version__
+from mouse_kvm import __version__, control
 from mouse_kvm.backend import create_backend
 from mouse_kvm.client import Client
+from mouse_kvm.filetransfer import human_size
 from mouse_kvm.host import SIDES, Host
 from mouse_kvm.keys import key_name
 
@@ -62,6 +73,7 @@ def cmd_host(args) -> int:
         bind=args.bind,
         edge_threshold=args.edge,
         enable_clip=not args.no_clip,
+        ctl_port=args.ctl_port,
     )
     _install_signals(host.shutdown)
     host.run()
@@ -78,6 +90,7 @@ def cmd_client(args) -> int:
         backend=backend,
         token=args.token,
         enable_clip=not args.no_clip,
+        ctl_port=args.ctl_port,
     )
 
     def stop(*_):
@@ -85,6 +98,118 @@ def cmd_client(args) -> int:
 
     _install_signals(stop)
     client.run()
+    return 0
+
+
+def cmd_send(args) -> int:
+    """把本地文件推给对端。需要本机 KVM 进程正在运行。"""
+    files = []
+    for raw in args.files:
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(path):
+            print("跳过（不是文件）：%s" % raw, file=sys.stderr)
+            continue
+        files.append(path)
+    if not files:
+        print("没有可发送的文件", file=sys.stderr)
+        return 1
+
+    failed = 0
+    for idx, path in enumerate(files, 1):
+        if len(files) > 1:
+            print("[%d/%d] %s" % (idx, len(files), os.path.basename(path)))
+        try:
+            _push_one(args, path)
+        except Exception as exc:   # noqa: BLE001
+            print("  失败：%s" % exc, file=sys.stderr)
+            failed += 1
+    return 1 if failed else 0
+
+
+def _push_one(args, path: str) -> None:
+    try:
+        sock = control.connect(args.ctl_port, args.ctl_host)
+    except OSError as exc:
+        raise RuntimeError(
+            "连不上本机的控制通道 %s:%d（%s）。"
+            "先确认 kvm.py 正在运行；如果改过 --port，"
+            "send 这边要同步用 --ctl-port 指定。"
+            % (args.ctl_host, args.ctl_port, exc)) from exc
+
+    reader = control.LineReader(sock)
+    size = os.path.getsize(path)
+    req = {"cmd": "send", "path": path}
+    if args.to:
+        req["to"] = args.to
+    try:
+        control.send_request(sock, req)
+        while True:
+            msg = reader.readline()
+            if msg is None:
+                raise RuntimeError("对端断开了控制连接")
+            t = msg.get("t")
+            if t == "start":
+                print("  -> %s  %s" % (msg.get("to") or "?",
+                                       human_size(int(msg.get("size") or size))))
+            elif t == "progress":
+                sent = int(msg.get("sent") or 0)
+                pct = (sent * 100.0 / size) if size else 100.0
+                sys.stdout.write("\r  %5.1f%%  %s / %s"
+                                 % (pct, human_size(sent), human_size(size)))
+                sys.stdout.flush()
+            elif t == "done":
+                if size:
+                    sys.stdout.write("\r")
+                    sys.stdout.flush()
+                if msg.get("ok"):
+                    print("  已送达 %s：%s" % (msg.get("to") or "?",
+                                              msg.get("path") or ""))
+                    return
+                raise RuntimeError(msg.get("err") or "对端接收失败")
+            else:
+                continue
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def cmd_status(args) -> int:
+    """看一眼对端在线情况。"""
+    try:
+        sock = control.connect(args.ctl_port, args.ctl_host)
+    except OSError as exc:
+        print("连不上控制通道 %s:%d：%s" % (args.ctl_host, args.ctl_port, exc),
+              file=sys.stderr)
+        return 1
+    try:
+        control.send_request(sock, {"cmd": "status"})
+        msg = control.LineReader(sock).readline()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    if not msg or not msg.get("ok"):
+        print("查询失败：%s" % (msg or {}).get("err", "无响应"), file=sys.stderr)
+        return 1
+    if "peers" in msg:
+        print("主机：%s" % msg.get("host"))
+        peers = msg.get("peers") or []
+        if not peers:
+            print("  没有从机连接")
+        for p in peers:
+            print("  %-16s 位置=%-6s 屏幕=%dx%d  %s"
+                  % (p.get("name"), p.get("side"),
+                     p.get("screen", [0, 0])[0], p.get("screen", [0, 0])[1],
+                     "在线" if p.get("alive") else "已断开"))
+    else:
+        print("从机：%s" % msg.get("client"))
+        print("  主机：%s  连接=%s  被接管=%s"
+              % (msg.get("host"),
+                 "是" if msg.get("connected") else "否",
+                 "是" if msg.get("active") else "否"))
     return 0
 
 
@@ -161,6 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--edge", type=int, default=3,
                    help="触发切换所需的外推次数，越小越灵敏（默认 3）")
     h.add_argument("--no-clip", action="store_true", help="不同步剪贴板")
+    h.add_argument("--ctl-port", type=int, default=None,
+                   help="本地控制通道端口，供 kvm.py send 使用（默认 端口+1）")
     h.set_defaults(func=cmd_host)
 
     c = sub.add_parser("client", help="在被控电脑上运行")
@@ -169,7 +296,26 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--port", type=int, default=DEFAULT_PORT, help="主机端口")
     c.add_argument("--token", default="", help="连接口令，两台电脑需一致")
     c.add_argument("--no-clip", action="store_true", help="不同步剪贴板")
+    c.add_argument("--ctl-port", type=int, default=None,
+                   help="本地控制通道端口，供 kvm.py send 使用（默认 端口+1）")
     c.set_defaults(func=cmd_client)
+
+    s = sub.add_parser("send", help="把文件推给对端（需本机 KVM 正在运行）")
+    s.add_argument("files", nargs="+", metavar="文件")
+    s.add_argument("--to", default=None,
+                   help="目标从机名；只有一台从机时可省略")
+    s.add_argument("--ctl-port", type=int, default=DEFAULT_PORT + 1,
+                   help="本机控制通道端口（默认 %d）" % (DEFAULT_PORT + 1))
+    s.add_argument("--ctl-host", default=control.CTL_HOST,
+                   help="控制通道地址（默认 127.0.0.1）")
+    s.set_defaults(func=cmd_send)
+
+    st = sub.add_parser("status", help="查看对端在线情况")
+    st.add_argument("--ctl-port", type=int, default=DEFAULT_PORT + 1,
+                    help="本机控制通道端口（默认 %d）" % (DEFAULT_PORT + 1))
+    st.add_argument("--ctl-host", default=control.CTL_HOST,
+                    help="控制通道地址（默认 127.0.0.1）")
+    st.set_defaults(func=cmd_status)
 
     pr = sub.add_parser("probe", help="只监听不拦截，验证权限与钩子")
     pr.add_argument("--seconds", type=float, default=0,
