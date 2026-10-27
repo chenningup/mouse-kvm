@@ -106,8 +106,8 @@ def cmd_send(args) -> int:
     files = []
     for raw in args.files:
         path = os.path.abspath(os.path.expanduser(raw))
-        if not os.path.isfile(path):
-            print("跳过（不是文件）：%s" % raw, file=sys.stderr)
+        if not os.path.exists(path):
+            print("跳过（不存在）：%s" % raw, file=sys.stderr)
             continue
         files.append(path)
     if not files:
@@ -137,7 +137,7 @@ def _push_one(args, path: str) -> None:
             % (args.ctl_host, args.ctl_port, exc)) from exc
 
     reader = control.LineReader(sock)
-    size = os.path.getsize(path)
+    total = os.path.getsize(path) if os.path.isfile(path) else 0
     req = {"cmd": "send", "path": path}
     if args.to:
         req["to"] = args.to
@@ -149,16 +149,18 @@ def _push_one(args, path: str) -> None:
                 raise RuntimeError("对端断开了控制连接")
             t = msg.get("t")
             if t == "start":
+                total = int(msg.get("size") or total)
                 print("  -> %s  %s" % (msg.get("to") or "?",
-                                       human_size(int(msg.get("size") or size))))
+                                       human_size(total)))
             elif t == "progress":
+                total = int(msg.get("total") or total)
                 sent = int(msg.get("sent") or 0)
-                pct = (sent * 100.0 / size) if size else 100.0
+                pct = (sent * 100.0 / total) if total else 100.0
                 sys.stdout.write("\r  %5.1f%%  %s / %s"
-                                 % (pct, human_size(sent), human_size(size)))
+                                 % (pct, human_size(sent), human_size(total)))
                 sys.stdout.flush()
             elif t == "done":
-                if size:
+                if total:
                     sys.stdout.write("\r")
                     sys.stdout.flush()
                 if msg.get("ok"):
@@ -300,8 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="本地控制通道端口，供 kvm.py send 使用（默认 端口+1）")
     c.set_defaults(func=cmd_client)
 
-    s = sub.add_parser("send", help="把文件推给对端（需本机 KVM 正在运行）")
-    s.add_argument("files", nargs="+", metavar="文件")
+    s = sub.add_parser("send", help="把文件或文件夹推给对端（需本机 KVM 正在运行）")
+    s.add_argument("files", nargs="+", metavar="路径")
     s.add_argument("--to", default=None,
                    help="目标从机名；只有一台从机时可省略")
     s.add_argument("--ctl-port", type=int, default=DEFAULT_PORT + 1,

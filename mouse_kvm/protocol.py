@@ -31,7 +31,8 @@ MSG_CLIP = "clip"            # {text}   剪贴板文本
 MSG_CLIP_FILES = "clip_files"  # {paths}  把对端收到的文件放进本机剪贴板（CF_HDROP）
 
 # 文件传输
-MSG_FILE_REQ = "file_req"      # {id, name, size}
+MSG_FILE_BATCH = "file_batch"  # {id, root, count} 宣告一次整目录传输，回执带目录路径
+MSG_FILE_REQ = "file_req"      # {id, name, size, batch?, rel?}
 MSG_FILE_CHUNK = "file_chunk"  # {id, seq, data}
 MSG_FILE_END = "file_end"      # {id}
 MSG_FILE_ACK = "file_ack"      # {id, ok, path, err}

@@ -18,8 +18,9 @@ from pathlib import Path
 from . import control, protocol as P
 from .backend.base import Backend
 from .clipboard import MAX_TEXT_BYTES, ClipboardSync
-from .filetransfer import (MAX_FILE_SIZE, FileSender, ReceiveSession,
-                           TransferError, human_size, new_transfer_id)
+from .filetransfer import (MAX_FILE_SIZE, AckSlot, FileSender, ReceiveSession,
+                           TransferError, collect_tree, human_size,
+                           new_transfer_id, send_tree)
 from .keys import key_name
 
 log = logging.getLogger("kvm.client")
@@ -40,6 +41,7 @@ class _SendJob:
         self.done = threading.Event()
         self.result: dict | None = None
         self.error: str | None = None
+        self.total: int | None = None      # 目录传输时预先算好的总字节数
         self.start_cb = None
         self.progress_cb = None
 
@@ -204,7 +206,8 @@ class Client:
             if self.clip is not None and self.clip.apply_remote(text):
                 log.info("<< 剪贴板来自主机（%d 字符）", len(text))
 
-        elif t in (P.MSG_FILE_REQ, P.MSG_FILE_CHUNK, P.MSG_FILE_END):
+        elif t in (P.MSG_FILE_BATCH, P.MSG_FILE_REQ,
+                   P.MSG_FILE_CHUNK, P.MSG_FILE_END):
             self.rxfile.handle(msg)
 
         elif t == P.MSG_FILE_ACK:
@@ -255,10 +258,17 @@ class Client:
             reply({"t": "done", "ok": False, "err": "缺少 path"})
             return
         path = Path(os.path.abspath(os.path.expanduser(raw)))
-        if not path.is_file():
-            reply({"t": "done", "ok": False, "err": "不是文件：%s" % path})
+        if not path.exists():
+            reply({"t": "done", "ok": False, "err": "找不到：%s" % path})
             return
         job = _SendJob([path])
+        if path.is_dir():
+            try:
+                _items, total = collect_tree(path)
+            except TransferError as exc:
+                reply({"t": "done", "ok": False, "err": str(exc)})
+                return
+            job.total = total
         job.start_cb = lambda peer_name, size: reply(
             {"t": "start", "to": peer_name, "size": size, "name": path.name})
         job.progress_cb = lambda sent, total: reply(
@@ -290,8 +300,11 @@ class Client:
 
     def _do_send(self, job) -> dict:
         results = []
-        for path in job.paths:
-            results.append(self._send_one(path, job))
+        for item in job.paths:
+            if item.is_dir():
+                results.append(self._send_dir(item, job))
+            else:
+                results.append(self._send_one(item, job))
         if job.set_clip and results:
             paths = [r.get("path") for r in results if r.get("path")]
             if paths:
@@ -299,11 +312,53 @@ class Client:
                 if conn is None:
                     raise TransferError("与主机的连接已断开")
                 conn.send({"t": P.MSG_CLIP_FILES, "paths": paths})
-                log.info("文件已推到主机剪贴板（%d 个），可以在 Windows 上粘贴了",
+                log.info("已推到主机剪贴板（%d 项），可以在 Windows 上粘贴了",
                          len(paths))
         return results[-1] if results else {}
 
-    def _send_one(self, path: Path, job) -> dict:
+    def _send_dir(self, root: Path, job) -> dict:
+        """整目录传输：先拿对端目录路径，再逐个文件推。"""
+
+        def send_ctl(obj: dict) -> None:
+            conn = self.conn
+            if conn is None or not self.running:
+                raise TransferError("与主机的连接已断开")
+            conn.send(obj)
+
+        def batch_msg(bid: str, root_name: str, count: int) -> None:
+            slot = AckSlot()
+            with self._xfer_lock:
+                self._senders[bid] = slot
+            send_ctl({"t": P.MSG_FILE_BATCH, "id": bid,
+                      "root": root_name, "count": count})
+
+        def wait_ack(bid: str) -> dict:
+            with self._xfer_lock:
+                slot = self._senders.get(bid)
+            if slot is None:
+                raise TransferError("内部错误：目录回执不见了")
+            try:
+                return slot.wait()
+            finally:
+                with self._xfer_lock:
+                    self._senders.pop(bid, None)
+
+        def send_file(path: Path, bid: str, rel: str, on_progress) -> dict:
+            return self._send_one(path, job, batch=bid, rel=rel,
+                                  on_progress=on_progress, quiet=True)
+
+        log.info(">> 发送目录 %s 到主机", root.name)
+        if job.start_cb:
+            job.start_cb(self._host_name, job.total or 0)
+        result = send_tree(root, batch_msg, wait_ack, send_file,
+                           job.progress_cb)
+        log.info(">> 目录已送达主机：%s（%d 个文件）",
+                 result.get("path"), result.get("files", 0))
+        return {"path": result.get("path"), "to": self._host_name}
+
+    def _send_one(self, path: Path, job, batch: str | None = None,
+                  rel: str | None = None, on_progress=None,
+                  quiet: bool = False) -> dict:
         size = path.stat().st_size
         fid = new_transfer_id()
 
@@ -313,12 +368,13 @@ class Client:
                 raise TransferError("与主机的连接已断开")
             conn.send(obj)
 
-        if job.start_cb:
+        if job.start_cb and not quiet:
             job.start_cb(self._host_name, size)
-        log.info(">> 发送 %s（%s）到主机",
-                 path.name, human_size(size))
+        (log.debug if quiet else log.info)(">> 发送 %s（%s）到主机",
+                                           path.name, human_size(size))
 
-        sender = FileSender(fid, path, send_fn, job.progress_cb)
+        cb = on_progress if on_progress is not None else job.progress_cb
+        sender = FileSender(fid, path, send_fn, cb, batch=batch, rel=rel)
         with self._xfer_lock:
             self._senders[fid] = sender
         try:
@@ -327,7 +383,8 @@ class Client:
             with self._xfer_lock:
                 self._senders.pop(fid, None)
 
-        log.info(">> 已送达主机：%s", result.get("path"))
+        (log.debug if quiet else log.info)(">> 已送达主机：%s",
+                                           result.get("path"))
         return {"path": result.get("path"), "to": self._host_name}
 
     # -- 剪贴板 -------------------------------------------------------------
@@ -342,6 +399,9 @@ class Client:
         for raw in files:
             p = Path(raw)
             try:
+                if p.is_dir():
+                    paths.append(p)          # 文件夹整个传，大小在 collect_tree 里查
+                    continue
                 if not p.is_file():
                     continue
                 if p.stat().st_size > MAX_FILE_SIZE:

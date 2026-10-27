@@ -28,6 +28,8 @@ log = logging.getLogger("kvm.xfer")
 
 CHUNK_SIZE = 256 * 1024
 MAX_FILE_SIZE = 512 * 1024 * 1024   # 512MB，再大就不该走这条路了
+MAX_TREE_FILES = 2000               # 整个目录最多这么多文件
+MAX_TREE_BYTES = 2 * 1024 * 1024 * 1024   # 整个目录最多 2GB
 PROGRESS_INTERVAL = 0.15            # 秒，进度回调节流
 ACK_TIMEOUT = 60.0                  # 秒，等对端回执的上限
 
@@ -104,6 +106,73 @@ def new_transfer_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
+def collect_tree(root: Path):
+    """列出目录下所有要传的文件，返回 ([(相对路径, 本地路径, 大小)], 总字节)。
+
+    跳过符号链接（防止成环和跳出目录），相对路径统一用 posix 分隔符。
+    """
+    root = Path(root)
+    items: list[tuple[str, Path, int]] = []
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames
+                       if not os.path.islink(os.path.join(dirpath, d))]
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > MAX_FILE_SIZE:
+                raise TransferError("「%s」超过单文件上限 %s"
+                                    % (name, human_size(MAX_FILE_SIZE)))
+            total += size
+            if len(items) >= MAX_TREE_FILES:
+                raise TransferError("文件太多，超过 %d 个" % MAX_TREE_FILES)
+            if total > MAX_TREE_BYTES:
+                raise TransferError("整个目录超过 %s" % human_size(MAX_TREE_BYTES))
+            items.append((path.relative_to(root).as_posix(), path, size))
+    items.sort(key=lambda x: x[0])
+    return items, total
+
+
+def send_tree(root: Path, batch_msg_fn, wait_ack_fn, send_file_fn,
+              progress=None) -> dict:
+    """推一个目录：先宣告批次拿到对端目录路径，再逐个文件推过去。
+
+    batch_msg_fn(batch_id, root_name, count)  -> None
+    wait_ack_fn(batch_id)                     -> {"ok":..., "path":...}
+    send_file_fn(path, batch_id, rel, on_progress) -> dict
+    """
+    root = Path(root)
+    items, total = collect_tree(root)
+    if not items:
+        raise TransferError("文件夹里没有可传的文件（空目录或全是符号链接）")
+
+    batch_id = new_transfer_id()
+    batch_msg_fn(batch_id, root.name, len(items))
+    result = wait_ack_fn(batch_id)
+    base_path = result.get("path")
+    if not base_path:
+        raise TransferError("对端没有返回目录路径")
+
+    sent = 0
+    for rel, path, size in items:
+        inner = None
+        if progress:
+            base = sent
+
+            def inner(done, _size, _base=base):
+                progress(_base + done, total)
+        send_file_fn(path, batch_id, rel, inner)
+        sent += size
+        if progress:
+            progress(sent, total)
+    return {"path": base_path, "files": len(items)}
+
+
 # ---- 接收端 ---------------------------------------------------------------
 class FileReceiver:
     """把一个文件的分块拼回本地磁盘。
@@ -118,14 +187,43 @@ class FileReceiver:
         self.expected = 0
         self.received = 0
         self._fh = None
+        self._batches: dict[str, Path] = {}
 
-    def begin(self, fid: str, name: str, size: int) -> Path:
+    def begin_batch(self, batch_id: str, root_name: str) -> Path:
+        """为一个目录传输分配落地目录（整体不重名）。"""
+        target = unique_path(inbox_dir(), safe_name(root_name) or "folder")
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError("建不了目录：%s" % exc) from exc
+        # 只留最近 16 个批次，避免长跑之后无限增长
+        if len(self._batches) >= 16:
+            self._batches.pop(next(iter(self._batches)), None)
+        self._batches[batch_id] = target
+        return target
+
+    def begin(self, fid: str, name: str, size: int,
+              batch: str | None = None, rel: str | None = None) -> Path:
         self.abort()
         if size < 0 or size > MAX_FILE_SIZE:
             raise ValueError("文件过大：%s（上限 %s）"
                              % (human_size(size), human_size(MAX_FILE_SIZE)))
-        target_dir = inbox_dir()
-        self.final_path = unique_path(target_dir, safe_name(name))
+
+        base = self._batches.get(batch) if batch else None
+        if base is not None and rel:
+            parts = [safe_name(p) for p in rel.replace("\\", "/").split("/")
+                     if p and p not in (".", "..")]
+            if not parts:
+                raise ValueError("非法相对路径：%r" % rel)
+            target = base.joinpath(*parts)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError("建不了目录：%s" % exc) from exc
+            self.final_path = unique_path(target.parent, target.name)
+        else:
+            self.final_path = unique_path(inbox_dir(), safe_name(name))
+
         self.temp_path = self.final_path.with_suffix(
             self.final_path.suffix + ".part")
         self._fh = open(self.temp_path, "wb")
@@ -192,7 +290,9 @@ class ReceiveSession:
 
     def handle(self, msg: dict) -> None:
         t = msg.get("t")
-        if t == P.MSG_FILE_REQ:
+        if t == P.MSG_FILE_BATCH:
+            self._on_batch(msg)
+        elif t == P.MSG_FILE_REQ:
             self._on_req(msg)
         elif t == P.MSG_FILE_CHUNK:
             self._on_chunk(msg)
@@ -205,12 +305,29 @@ class ReceiveSession:
         self._fail = None
 
     # -- 内部 ---------------------------------------------------------------
+    def _on_batch(self, msg: dict) -> None:
+        bid = str(msg.get("id") or "")
+        root = str(msg.get("root") or "folder")
+        count = int(msg.get("count") or 0)
+        try:
+            target = self.rx.begin_batch(bid, root)
+        except Exception as exc:
+            self._fail = (bid, str(exc))
+            self._ack(bid, False, None, str(exc))
+            log.error("拒绝接收目录 %s：%s", root, exc)
+            return
+        log.info("<< 开始接收目录 %s（%d 个文件）%s", target.name, count,
+                 ("来自 " + self.label) if self.label else "")
+        self._ack(bid, True, str(target), None)
+
     def _on_req(self, msg: dict) -> None:
         fid = str(msg.get("id") or "")
         name = str(msg.get("name") or "")
         size = int(msg.get("size") or 0)
+        batch = msg.get("batch") or None
+        rel = msg.get("rel") or None
         try:
-            target = self.rx.begin(fid, name, size)
+            target = self.rx.begin(fid, name, size, batch=batch, rel=rel)
         except Exception as exc:
             # 不在这里回执 —— 发送方只认 END 时的 ACK，
             # 这里只记下失败原因，块全部丢弃，END 时再统一回一条失败。
@@ -261,6 +378,31 @@ class ReceiveSession:
 
 
 # ---- 发送端 ---------------------------------------------------------------
+class AckSlot:
+    """只等一条回执的占位对象，接口和 FileSender 对齐。
+
+    目录传输先发 MSG_FILE_BATCH 拿落地路径，这时候还没有 FileSender，
+    但回执走的是同一条通道，所以让它俩长得一样最省事。
+    """
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self.result: dict | None = None
+
+    def deliver_ack(self, ok: bool, path: str | None,
+                    err: str | None) -> None:
+        self.result = {"ok": ok, "path": path, "err": err}
+        self._event.set()
+
+    def wait(self, timeout: float = ACK_TIMEOUT) -> dict:
+        if not self._event.wait(timeout):
+            raise TransferError("等对端确认超时（%.0f 秒）" % timeout)
+        result = self.result or {}
+        if not result.get("ok"):
+            raise TransferError(result.get("err") or "对端接收失败")
+        return result
+
+
 class FileSender:
     """把一个文件推给对端。
 
@@ -269,9 +411,12 @@ class FileSender:
     """
 
     def __init__(self, fid: str, path: Path, send_fn,
-                 on_progress=None) -> None:
+                 on_progress=None, batch: str | None = None,
+                 rel: str | None = None) -> None:
         self.fid = fid
         self.path = Path(path)
+        self.batch = batch
+        self.rel = rel
         self._send = send_fn
         self._progress = on_progress
         self._ack = threading.Event()
@@ -294,8 +439,13 @@ class FileSender:
             raise TransferError("文件太大：%s（上限 %s）"
                                 % (human_size(size), human_size(MAX_FILE_SIZE)))
 
-        self._send({"t": P.MSG_FILE_REQ, "id": self.fid,
-                    "name": self.path.name, "size": size})
+        req = {"t": P.MSG_FILE_REQ, "id": self.fid,
+               "name": self.path.name, "size": size}
+        if self.batch:
+            req["batch"] = self.batch
+        if self.rel:
+            req["rel"] = self.rel
+        self._send(req)
 
         sent = 0
         last_report = 0.0

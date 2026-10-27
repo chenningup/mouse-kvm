@@ -113,6 +113,47 @@ def main() -> int:
         sess = F.ReceiveSession(lambda obj: None)
         sess.handle({"t": P.MSG_FILE_CHUNK, "id": "nope", "seq": 0, "data": "YWJj"})
         check("孤块被吞掉不抛异常", True)
+
+        print("[10] 目录扫描")
+        tree = tmp / "proj"
+        (tree / "sub" / "deep").mkdir(parents=True)
+        (tree / "a.txt").write_text("a")
+        (tree / "sub" / "b.txt").write_text("bb")
+        (tree / "sub" / "deep" / "c.bin").write_bytes(b"ccc")
+        items, total = F.collect_tree(tree)
+        rels = sorted(i[0] for i in items)
+        check("递归收全了", rels == ["a.txt", "sub/b.txt", "sub/deep/c.bin"], str(rels))
+        check("相对路径用 posix 分隔符", all("\\" not in r for r in rels))
+        check("总大小正确", total == 1 + 2 + 3, str(total))
+
+        empty = tmp / "empty"
+        empty.mkdir()
+        check("空目录扫出 0 个文件", F.collect_tree(empty)[0] == [])
+
+        print("[11] 目录完整往返")
+        ok4 = _roundtrip_tree(tree)
+        check("目录往返成功", ok4 is not None and ok4[0], str(ok4))
+        if ok4 and ok4[0]:
+            root = Path(ok4[1])
+            check("落地是一个目录", root.is_dir(), str(root))
+            check("目录名保留", root.name.startswith("proj"), root.name)
+            got = sorted(p.relative_to(root).as_posix()
+                         for p in root.rglob("*") if p.is_file())
+            check("目录结构完整", got == rels, str(got))
+            check("内容一致", (root / "sub" / "deep" / "c.bin").read_bytes() == b"ccc")
+
+        print("[12] 同名目录不覆盖")
+        ok5 = _roundtrip_tree(tree)
+        check("第二次落地到不同目录", ok5 is not None and ok5[0]
+              and Path(ok5[1]).name != Path(ok4[1]).name,
+              "%s vs %s" % (ok4[1], ok5 and ok5[1]))
+
+        print("[13] 目录里的路径穿越被挡住")
+        rx4 = F.FileReceiver()
+        base = rx4.begin_batch("b1", "safe")
+        target = rx4.begin("f9", "x.txt", 1, batch="b1", rel="../../evil.txt")
+        check("落在批次目录里", base in target.parents, str(target))
+        rx4.abort()
     finally:
         F.inbox_dir = real_inbox
         shutil.rmtree(tmp, ignore_errors=True)
@@ -168,6 +209,58 @@ def _roundtrip(src: Path, size: int, force_oversize: bool = False):
     if final.read_bytes() != src.read_bytes():
         return False, "内容不一致", len(progress)
     return True, str(final), len(progress)
+
+
+def _roundtrip_tree(src: Path):
+    """整个目录走一遍 send_tree，返回 (成功?, 对端目录路径 或 错误)。"""
+    slots: dict = {}
+
+    def rx_send(obj):
+        if obj.get("t") != P.MSG_FILE_ACK:
+            return
+        slot = slots.get(obj.get("id"))
+        if slot is not None:
+            slot.deliver_ack(bool(obj.get("ok")), obj.get("path"),
+                             obj.get("err"))
+
+    rx = F.ReceiveSession(rx_send)
+
+    def tx_send(obj):
+        rx.handle(obj)
+
+    result: dict = {}
+
+    def run():
+        try:
+            def batch_msg(bid, root_name, count):
+                slots[bid] = F.AckSlot()
+                tx_send({"t": P.MSG_FILE_BATCH, "id": bid,
+                         "root": root_name, "count": count})
+
+            def wait_ack(bid):
+                return slots.pop(bid).wait()
+
+            def send_file(path, bid, rel, on_progress):
+                fid = F.new_transfer_id()
+                sender = F.FileSender(fid, path, tx_send, on_progress,
+                                      batch=bid, rel=rel)
+                slots[fid] = sender
+                try:
+                    sender.run()
+                finally:
+                    slots.pop(fid, None)
+
+            result["tree"] = F.send_tree(src, batch_msg, wait_ack, send_file)
+        except Exception as exc:   # noqa: BLE001
+            result["err"] = str(exc)
+
+    th = threading.Thread(target=run)
+    th.start()
+    th.join(120)
+
+    if not result.get("tree"):
+        return False, result.get("err") or "无结果"
+    return True, result["tree"]["path"]
 
 
 if __name__ == "__main__":

@@ -358,8 +358,11 @@ class ClipboardSync:
     def start(self) -> None:
         if not self.enabled or self._running:
             return
-        # 以启动时的内容为基准，避免一启动就把旧内容推出去
+        # 以启动时的内容为基准，避免一启动就把旧内容推出去 ——
+        # 文本和文件都是如此，否则每次重启都会把剪贴板里那个文件夹再传一遍
         self._last = self._current_digest()
+        files = self._read_files()
+        self._last_files = digest("\x00".join(files)) if files else None
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="kvm-clip",
                                         daemon=True)
@@ -402,9 +405,10 @@ class ClipboardSync:
             files = getter() or []
         except Exception:
             return []
-        bad = [f for f in files if not os.path.isfile(f)]
+        bad = [f for f in files
+               if not (os.path.isfile(f) or os.path.isdir(f))]
         if bad:
-            # 有任何一个文件读不到就不当文件处理，退回普通文本
+            # 有任何一个文件/文件夹读不到就不当文件处理，退回普通文本
             return []
         return files[:MAX_CLIP_FILES]
 

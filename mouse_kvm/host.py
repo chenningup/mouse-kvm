@@ -23,8 +23,9 @@ from pathlib import Path
 from . import control, protocol as P
 from .backend import Backend
 from .clipboard import MAX_TEXT_BYTES, ClipboardSync, digest
-from .filetransfer import (FileSender, ReceiveSession, TransferError,
-                           human_size, new_transfer_id)
+from .filetransfer import (AckSlot, FileSender, ReceiveSession, TransferError,
+                           collect_tree, human_size, new_transfer_id,
+                           send_tree)
 from .keys import key_name
 
 log = logging.getLogger("kvm.host")
@@ -79,6 +80,7 @@ class _SendJob:
         self.done = threading.Event()
         self.result: dict | None = None
         self.error: str | None = None
+        self.total: int | None = None      # 目录传输时预先算好的总字节数
         self.start_cb = None
         self.progress_cb = None
 
@@ -321,11 +323,20 @@ class Host:
             reply({"t": "done", "ok": False, "err": "缺少 path"})
             return
         path = Path(os.path.abspath(os.path.expanduser(raw)))
-        if not path.is_file():
-            reply({"t": "done", "ok": False, "err": "不是文件：%s" % path})
+        if not path.exists():
+            reply({"t": "done", "ok": False, "err": "找不到：%s" % path})
             return
 
         job = _SendJob(path, req.get("to") or None)
+        if path.is_dir():
+            # 先把目录扫一遍：空目录、超限这类问题在这里就回给用户，
+            # 不用等一条连接建起来才失败
+            try:
+                _items, total = collect_tree(path)
+            except TransferError as exc:
+                reply({"t": "done", "ok": False, "err": str(exc)})
+                return
+            job.total = total
         job.start_cb = lambda peer_name, size: reply(
             {"t": "start", "to": peer_name, "size": size,
              "name": path.name})
@@ -360,7 +371,53 @@ class Host:
 
     def _do_send(self, job) -> dict:
         peer = self._pick_peer(job.to_name)
-        size = job.path.stat().st_size
+        if job.path.is_dir():
+            return self._send_dir(peer, job.path, job)
+        return self._send_file(peer, job.path, job)
+
+    def _send_dir(self, peer: Peer, root: Path, job) -> dict:
+        """整目录传输：先拿对端目录路径，再逐个文件推。"""
+
+        def send_ctl(obj: dict) -> None:
+            if not peer.alive:
+                raise TransferError("与 %s 的连接已断开" % peer.name)
+            peer.conn.send(obj)
+
+        def batch_msg(bid: str, root_name: str, count: int) -> None:
+            slot = AckSlot()
+            with self._xfer_lock:
+                self._senders[bid] = slot
+            send_ctl({"t": P.MSG_FILE_BATCH, "id": bid,
+                      "root": root_name, "count": count})
+
+        def wait_ack(bid: str) -> dict:
+            with self._xfer_lock:
+                slot = self._senders.get(bid)
+            if slot is None:
+                raise TransferError("内部错误：目录回执不见了")
+            try:
+                return slot.wait()
+            finally:
+                with self._xfer_lock:
+                    self._senders.pop(bid, None)
+
+        def send_file(path: Path, bid: str, rel: str, on_progress) -> dict:
+            return self._send_file(peer, path, job, batch=bid, rel=rel,
+                                   on_progress=on_progress, quiet=True)
+
+        log.info(">> 发送目录 %s 到 %s", root.name, peer.name)
+        if job.start_cb:
+            job.start_cb(peer.name, job.total or 0)
+        result = send_tree(root, batch_msg, wait_ack, send_file,
+                           job.progress_cb)
+        log.info(">> 目录已送达 %s：%s（%d 个文件）",
+                 peer.name, result.get("path"), result.get("files", 0))
+        return {"path": result.get("path"), "to": peer.name}
+
+    def _send_file(self, peer: Peer, path: Path, job,
+                   batch: str | None = None, rel: str | None = None,
+                   on_progress=None, quiet: bool = False) -> dict:
+        size = path.stat().st_size
         fid = new_transfer_id()
 
         def send_fn(obj: dict) -> None:
@@ -370,12 +427,14 @@ class Host:
                 raise TransferError("与 %s 的连接已断开" % peer.name)
             peer.conn.send(obj)
 
-        if job.start_cb:
+        if job.start_cb and not quiet:
             job.start_cb(peer.name, size)
-        log.info(">> 发送 %s（%s）到 %s",
-                 job.path.name, human_size(size), peer.name)
+        (log.debug if quiet else log.info)(">> 发送 %s（%s）到 %s",
+                                           path.name, human_size(size),
+                                           peer.name)
 
-        sender = FileSender(fid, job.path, send_fn, job.progress_cb)
+        cb = on_progress if on_progress is not None else job.progress_cb
+        sender = FileSender(fid, path, send_fn, cb, batch=batch, rel=rel)
         with self._xfer_lock:
             self._senders[fid] = sender
         try:
@@ -384,7 +443,8 @@ class Host:
             with self._xfer_lock:
                 self._senders.pop(fid, None)
 
-        log.info(">> 已送达 %s：%s", peer.name, result.get("path"))
+        (log.debug if quiet else log.info)(">> 已送达 %s：%s",
+                                           peer.name, result.get("path"))
         return {"path": result.get("path"), "to": peer.name}
 
     def _pick_peer(self, name: str | None):
@@ -759,7 +819,8 @@ class Host:
                                    msg.get("err"))
             else:
                 log.debug("收到未知传输的 ACK：%s", fid)
-        elif t in (P.MSG_FILE_REQ, P.MSG_FILE_CHUNK, P.MSG_FILE_END):
+        elif t in (P.MSG_FILE_BATCH, P.MSG_FILE_REQ,
+                   P.MSG_FILE_CHUNK, P.MSG_FILE_END):
             sess = self._receiver_for(src)
             if sess is not None:
                 sess.handle(msg)
