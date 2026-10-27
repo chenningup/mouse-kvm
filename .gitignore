@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 本地依赖（paramiko 等，仅调试工具用）
+.deps/
+.venv/
+venv/
+
+# 本地凭据与日志
+tools/.env
+*.log
+logs/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# WorkBuddy 本地记忆
+.workbuddy/

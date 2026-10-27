@@ -1,0 +1,14 @@
+# /etc/udev/rules.d/99-mouse-kvm.rules
+#
+# 让 input 组的用户能读写输入设备和 /dev/uinput，
+# 这样 mouse-kvm 不用 root 也能捕获和注入事件。
+#
+# 安装：
+#   sudo cp 99-mouse-kvm.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#   sudo usermod -aG input $USER      # 之后要重新登录
+
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="mouse*", MODE="0660", GROUP="input"

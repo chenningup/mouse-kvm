@@ -1,0 +1,15 @@
+[Unit]
+Description=mouse-kvm client (keyboard/mouse sharing slave)
+After=graphical.target network-online.target
+
+[Service]
+Type=simple
+# 把 HOST_IP 换成主机（连着键鼠那台）的局域网 IP
+ExecStart=/usr/bin/python3 %h/mouse-kvm/kvm.py client --name linux --host HOST_IP --port 24800
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/kvm-client.log
+StandardError=append:/tmp/kvm-client.log
+
+[Install]
+WantedBy=default.target
